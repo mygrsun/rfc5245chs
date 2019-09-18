@@ -1,0 +1,1352 @@
+https://tools.ietf.org/html/rfc5245的翻译
+
+交互式连接建立
+摘要
+    这篇文档描述了一种使用 offer/answer模式 针对udp多媒体会话建立的网络通信传输协议。这种协议叫做交互式连接建立（ICE）。ICE使用了针对NAT（STUN）及其扩展（TURN）的会话传输工具。ICE 可以被用于任何使用 offer/answer模式模型的协议，比如会话发起协议（SIP）协议。
+本文档的状态
+  这是一个网络标准追踪文档。
+  这个文档是一个IETF的产出产品。它代表了IETF社区的共识。它还接收了一些公共观点，并且被IESG批准发行。更多信息在网络标准网站可以看到https://tools.ietf.org/html/rfc5741#section-2
+  该文档状态的任何信息，任何错误以及如何提交反馈都可以在这里（http://www.rfc-editor.org/info/rfc5245.）找到
+版权提醒
+  该文档的作者是IETF信托以及认证会员。持有所有权利
+## 目录
+1、介绍
+2、ICE概述
+  2.1 候选地址收集
+  2.3 连接检查
+  2.3 候选地址排序
+  2.4 冻结候选地址
+  2.5 安全检查
+  2.6 结束ICE
+  2.7 轻量级实现
+
+## 1、介绍
+RFC 3264 定义了一个双相位的会话描述（SDP）交换消息（翻译的不好 RFC 3264 [RFC3264] defines a two-phase exchange of Session
+  Description Protocol (SDP) messages [RFC4566] for the purposes of
+  establishment of multimedia sessions.）用于多媒体会话建立，这种offer/answer的机制用于SIP等协议上。
+  使用offer/answer的协议在NATS网络上很难操作。因为它们的目的是为了建立一个媒体包的流，所以它们大多会携带着魅力源和接收器的ip地址和端口，这个在NAT中是已知的困难。这个协议也在想办法创建一个参与者之间直接的媒体流，以便不需要在中间部署用于调解或中转的中间层。这是为了减少媒体延时，减少丢包，减少应用部署的成本。然而，这在NAT中实现很困难，实现困难的完整原因在这里就不详细说了。
+  已经有多重方案可以实现协议在NAT上操作，比如应用层网关（ALGS）、中间件控制协议、STUN，并且为了能够正常工作还需要需要特殊IP域。比如会话描述协议（SDP）中的用于实时控制协议（RTCP）的属性。不幸的是，这些技术都是有利有弊，导致在默写网络中比较好，但在其它上面却表现不好。这就导致管理员和实施者必须要作出假设是哪种网络选择哪种方案。这就让系统变得复杂和脆弱。因此需要一种方案足够弹性用于在各种网络下工作都比较好。
+  这篇规范定义了交互式连接建立（ICE）作为一种用于使用offer/answer模型基于UDP的多媒体流在NAT穿透的的技术（尽管ICE可以被扩展为使用TCP等协议），并且可以在sbp中携带多个用于建立点对点连接的ip地址和端口。这些ip地址和端口被包含在sdp中，并且连通性检查是使用被改过的的STUN规范。
+  这个新名字和新规范反应了与其它NAT穿透技术一起作为一个工具的，而不是一个独立的穿透方案。ICE也使用了TRUN的一个扩展，叫做TURN。因为ICE交换多个IP和端口为每一个流，它也阴虚双网卡主机。因此不建议使用RFC4091和RFC￥092
+## ice的概述
+  一个典型的ICE部署，我们有两个端点（在RFC3264中叫做agents）想要通信。他们能够使用用间接的信号传输协议（比如sip）通信技术进行通信。，通过他们他可以执行offer/answer SDP的交换消息。注意ICE不是为了SIP的NAT穿透，它是提供了一种其它机制。在ICE过程的开始，agent就忽略了自己的网络拓扑。特别的是，有时候agents并没有在一个NAT后面（也可能处于多层NAT后面）。ICE允许agent发现足够多的关于他们拓扑结构的信息，用于找到更多的连接路径能够实现通信。
+  图1展示了一个典型ICE部署的环境。这两个端点被标记为L和R（也就是left和right，用于帮助可视化）。并且LheR都在各自的NATS下，当然它们自己是意识不到自己处于NATS下的。NAT的类型和特性也不知道。agent L和R有能力参与到offer/answer交换通过它来交换SDP信息，通过它来建立一个L和R之间的媒体会话。典型情况下，这个会发生在一个SIP server中。另外对于agents，一个sipserver和nats，iec通常用于有stun和turn服务的网络中每个agent可以有它们自己的stun和turn server，或者也可以是一个。
+  ICE背后的基本思想就是：每个agent有个不同的可以用来与其它agent通信的候选传输地址（对于udp这种特殊的会是，ip地址和端口的结合）。这包括:
+* 网卡上的地址
+* NAT的公共地址
+* turn server的地址
+  
+潜在的，任何L的候选传输地址都可以用于和R的任何一个候选地址通信。时间上缺失，很多对是不能工作的。比如，L和R都咋NATs下，他们的的直接网卡地址是不可能能够直接通信的（当然，这也是ice存在的原因）。ice的目的就是发现哪一对儿地址可以工作。ice的方式就是系统的尝试所有配对（有一个很严谨的顺序）知道找到能够工作的。
+### 2.1收集候选地址
+  为了执行ice，一个agent不得不识别所有的候选地址。一个候选地址有一个传输地址--ip和端口的结合的那种情况比较特殊。这个规范里定义了三种候选地址，有些来自物理或者逻辑网卡，其它的通过STUN和TURN来获得。自然地，最容易获得的候选地址就是直接从本地网卡获取。这种候选地址称作HOST CANDIDATE。本地网卡可以是因特网也可以是wifi，或者也可以是隧道途径，比如VPN或者MIP。这所有的情况，这种网卡暴露给agent都是一个某个端口的本地接口。
+  如果一个agent是一个多宿主主机，它就会有一个候选地址包括每个ip地址。依赖于这个端点在ip网络中的位置，agent可能有多个ip都能够到达。比如一个agent有一个本地ip地址在私有网络10 I1区段下，另外一个在公网I2下。一个也在同一个局域网下的从I1的候选地址是能够到达的。，而I2下的候选地址是可以被公网下的端点进行连接。为了防止还要猜测到底哪个ip更好的被连接，offer agent干脆把所有候选地址都放入offer中
+  接下来agent会使用STUN和TURN来获取其它的候选地址。这个可以有两个特性，1是获取NETs的公网地址 2是获取到TURN的地址。如果TURN 服务可以用的话，从TURN服务中两种类型的候选地址都能获取到。如果只有STUN 服务可以用，只有反查的候选地址可以获取到。这些和主机候选地址的关系在图2 可以看到。在这个图中从turn服务中两种类型的候选地址都获取到了。在图中，标记X:x表示ip地址X和udp端口x。
+  当agent从ip地址和端口X:x向turn服务发送分配请求时，NAT会创建一个X1:x1，映射反射地址到主机地址。从主机候选地址的出包会被NAT转换为主机反射候选地址。发送想反射候选地址的入包，会被NAT转换为主机候选地址并且转到agent上面。我们称主机候选地址和其关联的映射地址为”基础“。
+  注意：”基础“是指一个从agent发出的特殊的候选地址，这样，主机地址也是一种特殊情况，仍具有”基础“，只是”base“是它自己
+  当agent和turn之间有多个NATs层时，trun请求会在每个NAT上都有一个绑定，但只有最外层（离turn服务最近的NAT）的反射候选地址会被agent发现。如果agent不在NAT下，基础候选地址会和反射候选地址相同。并且反射候选地址会多余被删除掉。
+分配请求然后就会到达turn服务。turn服务从本地分配一个ip端口 Y:y 并创建回复。通知agent它的中继地址。turn服务也会通知agent它的反射地址，X1：x1倍放到了分配请求的源地址里面了，并放到了回复里。trun服务扮演着包中继的角色，在L和R之间转移通信。为了发送数据到L，R发送数据到turn服务在Y:y地址，turn服务转移到X1：x1地址，数据经过已经映射了X:x的NAT到达L。
+当只有stun服务可用时，agent发送stun绑定请求到stun服务。stun服务会通知agent服务的反射地址X1：x1 通过复制请求中的原地址到回复中。
+### 2.2 连接检查
+一旦L已经手机到了所欲的候选地址，它按照高低优先级排序，并且发送他们到R 通过信令通道。候选地址被包含在sdp offer的属性中。当R收到offer，它会执行相同的收集过程并且回复候选地址列表。在过程的最后，每个agent都有一个完整的列表，包含自己和对方的候选地址。它将他们配对，产出一个候选地址列表对。为了检查哪个地址工作，每个agent会安排一系列的检查。每个检查都是一个stun请求/回复 ，客户端会检查一个候选地址对通过从自己候选地址到对方候选地址发送stun请求，
+检查连接基础的原则：
+1.将候选地址按照优先级进行排序
+2.按照优先级顺序挨个发送检查
+3.确认从另一端收到的检查请求
+伴随着两端都要进行检查在候选地址对儿上，结果是一个4次握手
+
+ L                        R
+   -                        -
+   STUN request ->             \  L's
+             <- STUN response  /  check
+
+              <- STUN request  \  R's
+   STUN response ->            /  check
+
+                    Figure 3: Basic Connectivity Check
+
+
+需要明确知道的是发送和接收stun请求必须在同一个ip和端口，此ip和端口将会用于媒体传输（比如rtp/rtcp）。因此agents多路stun和rtc/rtcp 使用报的内容，而不是接收的端口。幸运的是，这种多路很容易做，特别是在rtp和rtcp
+因为一个stun绑定请求是一个用于检车连接的请求，stun绑定回复将会包含agent的转换过的agent和它的对端公共地址。如果一个传输地址不同于其它已经得到的候选地址，就说明这是一个新的候选地址叫做PEER REFLEXIVE CANDIDATE，然后ICE会像其它候选地址一样检测它。
+作为一个优化项，只要R得到L的检查消息，R就创建一个发送到L的相同候选地址的连接检查消息。这将加速找到可用候选地址的过程。被叫做触发式检查。
+握手的最后，L和R都会知道他们可以点对点的双向发送和接收消息。
+## 2.3 排序候选地址
+因为上面的算法搜索到了所有的候选地址，如果存在一个可用的候选地址，不论以怎样的顺序去尝试，总能找到这个候选地址。为了能够更快更好的得到结果，候选地址被按照特殊的顺序排序了。候选地址对最终的排序列表被称作“检查列表”。算法会在4.1.2描述，但遵循下面两条原则：
+* 每个agent都会分配一个数字优先级，并且会随着候选地址一起发送到对端
+* 本地和远端优先级是被结合起来的，就是为了每个agent对候选地址都有个相同的排序
+为了使ICE工作，当L和R中间存在NET时，第二个性质是非常重要的。因为NATs是不允许包从一个主机进入的，除非之前已经从发送过包到那个主机。因此ICE检查两个方向是不会成功的，除非之前互相发送过check通过他们的NATs
+Agent 通过向下一个候选地址对发送STUN包，来完成检查。这被称作”普通检查“。
+通常情况下，优先级算法被设计为相同类型会得到相似的优先级，并且尽量使用直接连接（也就是说尽量减少媒体中介）。在这里指导原则下，agents就有相当多的决定权来决定如何精调他们的算法。
+
+## 2.4 冻结候选地址
+之前的叙述只是致力于agents使用一个组件（一个媒体流需要一个单独的地址，一个媒体流可能需要多个组件，每个组件都是媒体流工作不可或缺的一部分，作为一个整体而存在）想要建立一个媒体会话。典型的（比如rtp和rtcp）agents需要建立多个流
+ 
+The network properties are likely to be very similar for each
+   component (especially because RTP and RTCP are sent and received from
+   the same IP address).  It is usually possible to leverage information
+   from one media component in order to determine the best candidates
+   for another.  ICE does this with a mechanism called "frozen
+   candidates".
+
+每一个组件的网络属性都表相似（主要因为 rtp和rtcp是从同一个ip接收和发送）。其它组件为了能够决定出最好的候选地址，一般是可以直接利用一个组件额网络信息。ICE这样做的机制称作”冷冻候选地址“
+每个候选地址都有一个叫做”地基“的属性。当两个候选地址相似（类型相同并且从同一个主机候选地址，并且stun服务使用相同的协议，否则地基就不同。）时，他们有相同的地基。一个候选地址对，也有一个地基，也就是他们各自候选地址的地基的拼接。刚开始，只有那些有唯一地基的候选地址对才能被测试。其它的候选地址被标记为”冷冻“。当候选地址对的连接性检查成功了，其它有相同基础的候选地址对才能被解冻。了避免重复的对各个组件进行检查，看似是很好，实时上也会有很多问题。
+
+
+While we've described "frozen" here as a separate mechanism for
+   expository purposes, in fact it is an integral part of ICE and the
+   ICE prioritization algorithm automatically ensures that the right
+   candidates are unfrozen and checked in the right order.
+
+当我们描述”冷冻“机制时，我们作为一个单独的机制来说明。事实上，它是ICE的一个完整部分，并且ICE优先级算法自动的确保正确的候选地址被解冻而且在正确的顺序进行检查。
+
+
+2.5.  Security for Checks
+
+   Because ICE is used to discover which addresses can be used to send
+   media between two agents, it is important to ensure that the process
+   cannot be hijacked to send media to the wrong location.  Each STUN
+   connectivity check is covered by a message authentication code (MAC)
+   computed using a key exchanged in the signaling channel.  This MAC
+   provides message integrity and data origin authentication, thus
+   stopping an attacker from forging or modifying connectivity check
+   messages.  Furthermore, if the SIP [RFC3261] caller is using ICE, and
+   their call forks, the ICE exchanges happen independently with each
+   forked recipient.  In such a case, the keys exchanged in the
+   signaling help associate each ICE exchange with each forked
+   recipient.
+
+2.5 安全检查
+因为ICE是为了发现在两个agent之间哪一个地址可以用来发送媒体，所以需要确保这个过程不能被攻击导致媒体发送到了错误的地址。每个 stun连接检查都有一个使用在在信令通道得到的一个key计算出来的消息验证码（mac）。这个mac提供完整性和数据来源认证，以此来阻止黑客伪造或者修改连接检查信息。另外，如果SIP发起者使用ICE，并且通话被复制。ice交换会独立的发送。这种情况下，信令通道中的密钥交换可以帮助ICE使用单独的通道交换（这里翻译的不好）
+
+
+2.6.  Concluding ICE
+
+   ICE checks are performed in a specific sequence, so that high-
+   priority candidate pairs are checked first, followed by lower-
+   priority ones.  One way to conclude ICE is to declare victory as soon
+   as a check for each component of each media stream completes
+   successfully.  Indeed, this is a reasonable algorithm, and details
+   for it are provided below.  However, it is possible that a packet
+   loss will cause a higher-priority check to take longer to complete.
+   In that case, allowing ICE to run a little longer might produce
+   better results.  More fundamentally, however, the prioritization
+   defined by this specification may not yield "optimal" results.  As an
+   example, if the aim is to select low-latency media paths, usage of a
+   relay is a hint that latencies may be higher, but it is nothing more
+   than a hint.  An actual round-trip time (RTT) measurement could be
+   made, and it might demonstrate that a pair with lower priority is
+   actually better than one with higher priority.
+
+2.6 ICE结束
+ICE 通过特定的序列进行检查，高优先级的先被检查然后是底优先级的。一种结束ICE的方式是当每个用于用于流媒体的组件都检查完了就声明为成功。事实上，这是个合理的算法，并且详细过程后面会说。然而，有种可能就是包丢失导致高优先级候选地址的检查会花费很长时间完成。这种情况，允许ice允许更长时间会有更好的结果。并且 这个规范中定义的优先级可能并不是最优的结果。作为一个例子，如果目标是选择出低延时的路径，使用一个中继或许延时就会长一些，但是也只是延时多一点点。可以做个实时测试,可能会发现低优先级的比高优先级的更好一些。
+
+ Consequently, ICE assigns one of the agents in the role of the
+   CONTROLLING AGENT, and the other of the CONTROLLED AGENT.  The
+   controlling agent gets to nominate which candidate pairs will get
+   used for media amongst the ones that are valid.  It can do this in
+   one of two ways -- using REGULAR NOMINATION or AGGRESSIVE NOMINATION.
+With regular nomination, the controlling agent lets the checks
+   continue until at least one valid candidate pair for each media
+   stream is found.  Then, it picks amongst those that are valid, and
+   sends a second STUN request on its NOMINATED candidate pair, but this
+   time with a flag set to tell the peer that this pair has been
+   nominated for use.  This is shown in Figure 4.
+
+ L                        R
+   -                        -
+   STUN request ->             \  L's
+             <- STUN response  /  check
+
+              <- STUN request  \  R's
+   STUN response ->            /  check
+
+   STUN request + flag ->      \  L's
+             <- STUN response  /  check
+
+                       Figure 4: Regular Nomination
+
+因此，ICE将其中一个agent分配为”主控agent“，其它的被叫做”被控制agent“。主控agent会指定，所有可用的候选地址中，哪一个候选地址对将用于媒体传输。可以采用一到两种方法，”均匀提名“和”激进式提名“，”均匀提名“是说主控检查一直进行，直到每个组件都找到至少一个可用的候选地址。然后，然后取出这些可用的，发起第二次stun请求，但是这次回进行标记告诉对方，这个候选地址是被提过名的。图4展示了这个过程。
+Once the STUN transaction with the flag completes, both sides cancel
+   any future checks for that media stream.  ICE will now send media
+   using this pair.  The pair an ICE agent is using for media is called
+   the SELECTED PAIR.
+
+一旦带有标记的stun请求过程结束，两边都将取消为其它媒体流的连接检查。ICE现在就可以使用这对候选地址发送流媒体。ICE选中的用于发送的候选地址叫做”选中对儿“
+
+In aggressive nomination, the controlling agent puts the flag in
+   every STUN request it sends.  This way, once the first check
+   succeeds, ICE processing is complete for that media stream and the
+   controlling agent doesn't have to send a second STUN request.  The
+   selected pair will be the highest-priority valid pair whose check
+   succeeded.  Aggressive nomination is faster than regular nomination,
+   but gives less flexibility.  Aggressive nomination is shown in
+   Figure 5.
+
+   L                        R
+   -                        -
+   STUN request + flag ->      \  L's
+             <- STUN response  /  check
+
+              <- STUN request  \  R's
+   STUN response ->            /  check
+
+                      Figure 5: Aggressive Nomination
+
+在激进式提名方式中，主控agent在每次stun请求中能够都设置标记。这种方式，一旦第一个检测成功，iCE就完成了选择过程。并且不再发送第二次stun请求。这个选中对儿，将有最高可用优先级。激进式提名比均匀是提名要快，但灵活性就差一些。侵入式如图5所示
+
+Once all of the media streams are completed, the controlling endpoint
+   sends an updated offer if the candidates in the m and c lines for the
+   media stream (called the DEFAULT CANDIDATES) don't match ICE's
+   SELECTED CANDIDATES.
+Once ICE is concluded, it can be restarted at any time for one or all
+   of the media streams by either agent.  This is done by sending an
+   updated offer indicating a restart.
+
+一旦所有媒体流都完成了，如果候选地址在m和c两条线中，主控节点发送一个更新offer。
+一旦ICE结束，它可在一个或者所有媒体流中被任何一个agent在任何时候重新启动。通过发送一个更新offer标记将要重启。
+
+
+2.7.  Lite Implementations
+
+   In order for ICE to be used in a call, both agents need to support
+   it.  However, certain agents will always be connected to the public
+   Internet and have a public IP address at which it can receive packets
+   from any correspondent.  To make it easier for these devices to
+   support ICE, ICE defines a special type of implementation called LITE
+   (in contrast to the normal FULL implementation).  A lite
+   implementation doesn't gather candidates; it includes only host
+   candidates for any media stream.  Lite agents do not generate
+   connectivity checks or run the state machines, though they need to be
+   able to respond to connectivity checks.  When a lite implementation
+   connects with a full implementation, the full agent takes the role of
+   the controlling agent, and the lite agent takes on the controlled
+   role.  When two lite implementations connect, no checks are sent.
+
+   For guidance on when a lite implementation is appropriate, see the
+   discussion in Appendix A.
+
+   It is important to note that the lite implementation was added to
+   this specification to provide a stepping stone to full
+   implementation.  Even for devices that are always connected to the
+   public Internet, a full implementation is preferable if achievable.
+
+
+## 2.7轻量级实现
+为了方便ICE使用，agents的两方都要去支持它。然后，某些agent会连接在公网上面，并且有一个可以接收任何通信数据包的公网ip地址。为了更简单的支持ICE，ICE定义了一种特殊类型的实现，叫做 ”轻量级实现“（相反，正常的叫做全实现）。一个轻量级实现不需要手机候选地址；它所有的媒体流都只包含主机候选地址。轻量级的agent不需要连接检查。当一个轻量级实现，连接到一个完整实现上，完整实现将作为主控agent，轻量agent作为被控放。当两个轻量实现连接时，没有检查被发送。
+
+想要看轻量实现，可以参照附录A
+需要注意的是，轻量实现在本规范中是全实现的一个垫脚石（优化）。即便是连接在公网，也是可以使用全实现的。
+
+
+3.  Terminology
+## 3. 专业词汇
+
+4. 发送初始化Offer
+为了能够发送初始化offer 在一个offer/answer交换中，一个agent必须（1）收集候选地址，（2）分配优先级（3）删除冗余的候选地址（4）选择默认的候选地址（5）构造和发送SDP offer。所有这些，只有最后一个轻量和全实现有所不同。
+
+
+4.1 全实现的请求
+4.1.1 收集候选地址
+An agent gathers candidates when it believes that communication is
+   imminent.  An offerer can do this based on a user interface cue, or
+   based on an explicit request to initiate a session.  Every candidate
+ is a transport address.  It also has a type and a base.  Four types
+   are defined and gathered by this specification -- host candidates,
+   server reflexive candidates, peer reflexive candidates, and relayed
+   candidates.  The server reflexive candidates are gathered using STUN
+   or TURN, and relayed candidates are obtained through TURN.  Peer
+   reflexive candidates are obtained in later phases of ICE, as a
+   consequence of connectivity checks.  The base of a candidate is the
+   candidate that an agent must send from when using that candidate.
+
+一个agent当觉得需要通信时，需要收集候选地址。一个offer 可以通过用户界面做这件事儿，或者基于一个请求来开始一个会话。每个候选地址都是一个传输地址。并且有一个类型和一个”基础“。本规范定义了四种类型。分别是：”主机候选地址“”服务反射候选地址“ ”端反射候选地址“”中继候选地址“。其中服务反射候选地址是采用stun或者turn获取的。中继候选地址只能使用turn。peer反射候选地址是在ICE的后期获取到的，作为一个连接检查序列。候选地址的”基础“是要使用时必须发送的。
+
+
+
+
+4.1.1.1.  Host Candidates
+
+   The first step is to gather host candidates.  Host candidates are
+   obtained by binding to ports (typically ephemeral) on a IP address
+   attached to an interface (physical or virtual, including VPN
+   interfaces) on the host.
+
+   For each UDP media stream the agent wishes to use, the agent SHOULD
+   obtain a candidate for each component of the media stream on each IP
+   address that the host has.  It obtains each candidate by binding to a
+   UDP port on the specific IP address.  A host candidate (and indeed
+   every candidate) is always associated with a specific component for
+   which it is a candidate.  Each component has an ID assigned to it,
+   called the component ID.  For RTP-based media streams, the RTP itself
+   has a component ID of 1, and RTCP a component ID of 2.  If an agent
+   is using RTCP, it MUST obtain a candidate for it.  If an agent is
+   using both RTP and RTCP, it would end up with 2*K host candidates if
+   an agent has K IP addresses.
+
+   The base for each host candidate is set to the candidate itself.
+
+
+4.11.1 主机候选地址
+收集候选地址的第一步，就是收集主机候选地址。主机候选地址通过网卡（物理或者虚拟以及vpn）接口获取到绑定在ip和端口。
+Agent应该为每一个将要使用的组件分配每个ip的候选地址。它获取到候选地址，通过绑定到某个ip的某个udp端口上。主机候选地址（事实上所有候选地址）总是与某个组件有关联。任何组件都有一个组件id关联在候选地址上。对于RTP 流来说，rtp自己有一个组件id 就是1.并且rtcp 有个组件id是2.如果一个agent使用rtcp，它必须为rtcp分配一个组件id。如果一个agent既有rtp又有rtcp，如果有K个网卡，它应该具有2*K个主机候选地址。
+候选地址的base是被设置到候选地址上的。
+
+
+
+4.1.1.2.  Server Reflexive and Relayed Candidates
+
+   Agents SHOULD obtain relayed candidates and SHOULD obtain server
+   reflexive candidates.  These requirements are at SHOULD strength to
+   allow for provider variation.  Use of STUN and TURN servers may be
+   unnecessary in closed networks where agents are never connected to
+   the public Internet or to endpoints outside of the closed network.
+   In such cases, a full implementation would be used for agents that
+   are dual stack or multihomed, to select a host candidate.  Use of
+   TURN servers is expensive, and when ICE is being used, they will only
+   be utilized when both endpoints are behind NATs that perform address
+   and port dependent mapping.  Consequently, some deployments might
+   consider this use case to be marginal, and elect not to use TURN
+   servers.  If an agent does not gather server reflexive or relayed
+   candidates, it is RECOMMENDED that the functionality be implemented
+   and just disabled through configuration, so that it can be re-enabled
+   through configuration if conditions change in the future.
+4.1.1.2主机反射候选地址
+Agents应该获取到中继候选地址和主机反射候选地址。这些需求只要满足 允许提供者变化。（翻译的不好），在那种完全没有连接到外网或者没有连接到外网节点上的封闭的网络下使用stun和turn服务已经没必要了。在这种情况下一个多网卡的agent会使用全实现的，选择一个主机候选地址。使用turn服务是非常昂贵的，当使用ice时，也只有双方都处于NATs下才会使用。这是就会进行ip和端口的映射。因此有些部署可能会考虑到这种情况，选择不使用turn服务。如果一个agent没有收集到主机反射候选地址和中继候选地址，推荐功能还是要有的，只是可以通过配置关闭这个，当将来环境变化时就重新打开就好了。
+
+If an agent is gathering both relayed and server reflexive
+   candidates, it uses a TURN server.  If it is gathering just server
+   reflexive candidates, it uses a STUN server.
+如果一个agent使用trun服务将会收集到中继候选地址和主机反射候选地址。如果使用stun服务，将只能收集到主机反射候选地址。
+
+
+   The agent next pairs each host candidate with the STUN or TURN server
+   with which it is configured or has discovered by some means.  If a
+   STUN or TURN server is configured, it is RECOMMENDED that a domain
+   name be configured, and the DNS procedures in [RFC5389] (using SRV
+   records with the "stun" service) be used to discover the STUN server,
+   and the DNS procedures in [RFC5766] (using SRV records with the
+   "turn" service) be used to discover the TURN server.
+接下来 agenthi挨个配对主机候选地址和stun或turn服务。stun和turn要么是被配置进去，也可能是通过其他方式发现。如果是配置进去的建议使用域名。
+
+
+   This specification only considers usage of a single STUN or TURN
+   server.  When there are multiple choices for that single STUN or TURN
+   server (when, for example, they are learned through DNS records and
+   multiple results are returned), an agent SHOULD use a single STUN or
+   TURN server (based on its IP address) for all candidates for a
+   particular session.  This improves the performance of ICE.  The
+   result is a set of pairs of host candidates with STUN or TURN
+   servers.  The agent then chooses one pair, and sends a Binding or
+   Allocate request to the server from that host candidate.  Binding
+   requests to a STUN server are not authenticated, and any ALTERNATE-
+   SERVER attribute in a response is ignored.  Agents MUST support the
+   backwards compatibility mode for the Binding request defined in
+   [RFC5389].  Allocate requests SHOULD be authenticated using a long-
+   term credential obtained by the client through some other means.
+该规范只考虑使用单个stun或者turn服务。当可选择多个时（比如通过df记录多个返回），一个agent的所有候选地址应该使用单独的一个（基于ip）。这样提高了ice的性能。结果是一系列的主机与stun的配对。agent然后会选择其中一对儿，然后那个主机候选地址发送绑定或者分配请求到那个服务。发往一个stun服务的绑定请求是不被允许的。交替服务属性在回复中是被忽略的。agent必须向后兼容模式，因为这个绑定请求是在RFC5389.使用一个通过其它途径获取的证书分配请求应该被允许。
+
+ Every Ta milliseconds thereafter, the agent can generate another new
+   STUN or TURN transaction.  This transaction can either be a retry of
+   a previous transaction that failed with a recoverable error (such as
+   authentication failure), or a transaction for a new host candidate
+   and STUN or TURN server pair.  The agent SHOULD NOT generate
+   transactions more frequently than one every Ta milliseconds.  See
+   Section 16 for guidance on how to set Ta and the STUN retransmit
+   timer, RTO.
+然后每 τ 毫秒，agent可以进行一次新的stun或turn请求。这个请求可以是之前能挽回失败请求的重试（比如授权失败），也可以为了新主机候选地址。agent的新的请求不能频率 不能少于τ。可以再第16节查到如何设置τ以及stun的重试间隔 RTO
+
+The agent will receive a Binding or Allocate response.  A successful
+   Allocate response will provide the agent with a server reflexive
+   candidate (obtained from the mapped address) and a relayed candidate
+   in the XOR-RELAYED-ADDRESS attribute.  If the Allocate request is
+   rejected because the server lacks resources to fulfill it, the agent
+   SHOULD instead send a Binding request to obtain a server reflexive
+   candidate.  A Binding response will provide the agent with only a
+   server reflexive candidate (also obtained from the mapped address).
+   The base of the server reflexive candidate is the host candidate from
+   which the Allocate or Binding request was sent.  The base of a
+   relayed candidate is that candidate itself.  If a relayed candidate
+   is identical to a host candidate (which can happen in rare cases),
+   the relayed candidate MUST be discarded.
+Agent 会收到绑定或者分配请求的回复。一个成功的分配回复会提供一个服务反射候选地址（从映射地址中得到）和一个中继候选地址XOR-RELAYED-ADDRESS属性 。发过分配请求因为缺少资源而被拒绝。agent应该发送一个绑定请求来获得服务反射候选地址。一个绑定请求将只能提供服务反射候选地址（同样也是从映射关系中获得）。服务反射候选地址的base是发送过去的主机候选地址。中继候选地址的base是它自己。如果一个中继候选地址和主机候选地址相同，那需要丢弃那个中继候选地址。
+
+
+4.1.1.3.  Computing Foundations
+## 4.1.1.3.  计算”地基“
+Finally, the agent assigns each candidate a foundation.  The
+   foundation is an identifier, scoped within a session.  Two candidates
+   MUST have the same foundation ID when all of the following are true:
+
+   o  they are of the same type (host, relayed, server reflexive, or
+      peer reflexive).
+
+   o  their bases have the same IP address (the ports can be different).
+
+   o  for reflexive and relayed candidates, the STUN or TURN servers
+      used to obtain them have the same IP address.
+
+   o  they were obtained using the same transport protocol (TCP, UDP,
+      etc.).
+
+   Similarly, two candidates MUST have different foundations if their
+   types are different, their bases have different IP addresses, the
+   STUN or TURN servers used to obtain them have different IP addresses,
+   or their transport protocols are different.
+
+最后，agent会给每个候选地址分配一个”地基“。地基是一个识别码，在会话期间有效。当满足下面条件时，两个候选地址的地基id必须相同。
+* 类型相同（主机、中继、服务反射、端反射）
+* base ip 相同（端口可以不一样）
+* 对于反射和中继类型的候选地址，stun和turn的服务ip相同。
+* 使用相同的协议获得（tcp、udp等）
+相似的，如果两个候选得知的类型不同，base ip不同，stun turn ip不同或者协议不同，那他们的地基id就不同。
+
+
+
+4.1.1.4.  Keeping Candidates Alive
+
+   Once server reflexive and relayed candidates are allocated, they MUST
+   be kept alive until ICE processing has completed, as described in
+   Section 8.3.  For server reflexive candidates learned through a
+   Binding request, the bindings MUST be kept alive by additional
+   Binding requests to the server.  Refreshes for allocations are done
+   using the Refresh transaction, as described in [RFC5766].  The
+   Refresh requests will also refresh the server reflexive candidate.
+
+## 4.1.1.4. 候选地址保活
+一旦服务反射候选地址和中继候选地址被分配了，他们必须一致可用，知道ice过程结束。8.3节将会详细说明。对于对于从绑定请求获取到的服务反射候选地址。绑定必须通过额外的绑定请求进行保活。可以使用刷新请求刷新分配，在RFC5766中有说明。刷新请求也会刷新服务的反射候选地址。
+
+
+
+
+4.1.2.  Prioritizing Candidates
+
+   The prioritization process results in the assignment of a priority to
+   each candidate.  Each candidate for a media stream MUST have a unique
+   priority that MUST be a positive integer between 1 and (2**31 - 1).
+   This priority will be used by ICE to determine the order of the
+   connectivity checks and the relative preference for candidates.
+
+   An agent SHOULD compute this priority using the formula in
+   Section 4.1.2.1 and choose its parameters using the guidelines in
+   Section 4.1.2.2.  If an agent elects to use a different formula, ICE
+   will take longer to converge since both agents will not be
+   coordinated in their checks.
+
+### 4.1.2. 候选地址优先级排序
+优先级排序可以给每个候选地址分配一个优先级，每个媒体流的候选地址都有一个唯一的介于1~2**31-1 的正整数。优先级决定了连接检查的顺序，也决定的相对接受程度。
+一个agent应该使用4.1.2.1的共识来计算有玄机，并参照4.1.2.2来选择参数。如果一个agent 选择其它公式，ICE将花费更长时间来统一，因为检查循序不协调
+
+
+
+
+4.1.2.1.  Recommended Formula
+
+   When using the formula, an agent computes the priority by determining
+   a preference for each type of candidate (server reflexive, peer
+   reflexive, relayed, and host), and, when the agent is multihomed,
+   choosing a preference for its IP addresses.  These two preferences
+   are then combined to compute the priority for a candidate.  That
+   priority is computed using the following formula:
+
+   priority = (2^24)*(type preference) +
+              (2^8)*(local preference) +
+              (2^0)*(256 - component ID)
+
+### 4.1.2.1. 推荐算法
+
+Agent通过对每种类型（服务反射，端反射，中继，主机候选地址）的喜好、以及当agent是多宿主时选择偏好的ip。这两个偏好结合起来计算候选地址的优先级。通过下面的公示计算
+priority = (2^24)*(type preference) +
+              (2^8)*(local preference) +
+              (2^0)*(256 - component ID)
+
+The type preference MUST be an integer from 0 to 126 inclusive, and
+   represents the preference for the type of the candidate (where the
+   types are local, server reflexive, peer reflexive, and relayed).  A
+   126 is the highest preference, and a 0 is the lowest.  Setting the
+   value to a 0 means that candidates of this type will only be used as
+   a last resort.  The type preference MUST be identical for all
+   candidates of the same type and MUST be different for candidates of
+   different types.  The type preference for peer reflexive candidates
+   MUST be higher than that of server reflexive candidates.  Note that
+   candidates gathered based on the procedures of Section 4.1.1 will
+   never be peer reflexive candidates; candidates of these type are
+   learned from the connectivity checks performed by ICE.
+
+type Preference必须是一个0到126的整数，并且代表了对候选类型（主机、服务反射、对端反射、中继）的偏好。126是最高的preference，0是最小的preference。把值设置成0 表示该类型的候选地址仅作为最后的手段。type preference必须是一个对所有类型可识别的，相同类型的必须相同，不同类型的必须不同。对端反射候选地址类型必须高于服务反射。注意基于4.1.1的过程收集到的候选地址绝不可能是对端反射候选地址。这种类型的候选地址是在ICE连接检查是得到的。
+
+The local preference MUST be an integer from 0 to 65535 inclusive.
+   It represents a preference for the particular IP address from which
+   the candidate was obtained, in cases where an agent is multihomed.
+   65535 represents the highest preference, and a zero, the lowest.
+   When there is only a single IP address, this value SHOULD be set to
+   65535.  More generally, if there are multiple candidates for a
+   particular component for a particular media stream that have the same
+   type, the local preference MUST be unique for each one.  In this
+   specification, this only happens for multihomed hosts.  If a host is
+   multihomed because it is dual stack, the local preference SHOULD be
+   set equal to the precedence value for IP addresses described in RFC
+   3484 [RFC3484].
+
+The component ID is the component ID for the candidate, and MUST be
+   between 1 and 256 inclusive.
+
+本地preference必须是一个0到65535的整数。就是在多网卡的情况下，它代表了对从某个ip获取到候选地址的偏好。65535代表了最高的票号，0是最晓得。当只有一个ip时，就需要设置为65536.更一般情况下，如果某个媒体流的某个组件有多个候选地址，有着相同的类型，那么本地preference就要每个不同。在本规范中，这只发生在多网卡情况下。如果一个主机是多网卡，本地preference应该设置为在RFC3484中的ip优先级。
+组件id就是候选地址的组件id，必须是一个1到256的整数。
+
+
+4.1.2.2.  Guidelines for Choosing Type and Local Preferences
+
+   One criterion for selection of the type and local preference values
+   is the use of a media intermediary, such as a TURN server, VPN
+   server, or NAT.  With a media intermediary, if media is sent to that
+   candidate, it will first transit the media intermediary before being
+   received.  Relayed candidates are one type of candidate that involves
+   a media intermediary.  Another are host candidates obtained from a
+   VPN interface.  When media is transited through a media intermediary,
+   it can increase the latency between transmission and reception.  It
+   can increase the packet losses, because of the additional router hops
+   that may be taken.  It may increase the cost of providing service,
+   since media will be routed in and right back out of a media
+   intermediary run by a provider.  If these concerns are important, the
+   type preference for relayed candidates SHOULD be lower than host
+   candidates.  The RECOMMENDED values are 126 for host candidates, 100
+   for server reflexive candidates, 110 for peer reflexive candidates,
+   and 0 for relayed candidates.  Furthermore, if an agent is multihomed
+   and has multiple IP addresses, the local preference for host
+   candidates from a VPN interface SHOULD have a priority of 0.
+
+#### 4.1.2.2.选择类型和本地preference
+
+一个选择类型和本地preference值的标准是 使用媒体中间件 不如trun 、vpn、和NAT。如果有媒体中间件，如果媒体被发往那个候选地址，它被接收前将首先被发往魅力中间件。中继候选地址就是一种媒体中间件。另外一种是主机候选地址从VPN中获取数据。当媒体流经过中间件时，会增加发送和接收的延时。同时也会因为增加路由跳数导致丢包率增加。也会增加提供服务的成本，因为媒体需要被导入和导出到媒体中间件。如果这些影响比较严重，中继候选地址类型的值就需要设置的比主机候选地址的小点。推荐主机候选地址设置为126，服务反射候选地址设置为100，对端反射候选地址设置为110，中继候选地址设置为0.而且，如果一个agent是多网卡，从vpn接收数据的的ip的本地preference应该是指为0
+
+ Another criterion for selection of preferences is IP address family.
+   ICE works with both IPv4 and IPv6.  It therefore provides a
+   transition mechanism that allows dual-stack hosts to prefer
+   connectivity over IPv6, but to fall back to IPv4 in case the v6
+   networks are disconnected (due, for example, to a failure in a 6to4
+   relay) [RFC3056].  It can also help with hosts that have both a
+   native IPv6 address and a 6to4 address.  In such a case, higher local
+   preferences could be assigned to the v6 addresses, followed by the
+   6to4 addresses, followed by the v4 addresses.  This allows a site to
+   obtain and begin using native v6 addresses immediately, yet still
+   fall back to 6to4 addresses when communicating with agents in other
+   sites that do not yet have native v6 connectivity.
+另外一个选择preference的标准是跟进ip族。ICE 既可以在IPv4也可以再IPv6下工作。它因此提供了一种多双栈转换机制，更喜欢使用IPv6 进行工作。但是如果IPv6 不通的情况下（比如ipv6转v4失败），也会回到IPv4.它也可以帮助那些既有IPv6也有IpV6到v4转换的主机。这种情况下，有限设置高本地preference给Ipv6，然后是6to4 地址，然后才是ipv4地址。这就允许站点可以直接使用ipv6，当连接的站点不支持ipv6时可以换回ipv4。
+
+Another criterion for selecting preferences is security.  If a user
+   is a telecommuter, and therefore connected to a corporate network and
+   a local home network, the user may prefer their voice traffic to be
+   routed over the VPN in order to keep it on the corporate network when
+   communicating within the enterprise, but use the local network when
+   communicating with users outside of the enterprise.  In such a case,
+   a VPN address would have a higher local preference than any other
+   address.
+还有一个设置标准是根据安全。如果一个用户时远程工作的，所以会连接在一个公共网和一个家庭网。用户在和公司通话时会希望语音数据使用VPN，但是和公司外的交流时希望使用本地网络。这种情况下，VPN地址可以使用一个更高的的本地preference。
+
+ Another criterion for selecting preferences is topological awareness.
+   This is most useful for candidates that make use of intermediaries.
+   In those cases, if an agent has preconfigured or dynamically
+   discovered knowledge of the topological proximity of the
+   intermediaries to itself, it can use that to assign higher local
+   preferences to candidates obtained from closer intermediaries.
+
+还有一个设置标准就是根据网络拓扑结构
+这种更多使用在使用媒体中间件的情况下。在这种情况下，如果agent提前配置了或者动态发现媒体中间件的网络拓扑结构。就可以给更近的媒体中间件设置更高的本地preference
+
+
+4.1.3.  Eliminating Redundant Candidates
+
+   Next, the agent eliminates redundant candidates.  A candidate is
+   redundant if its transport address equals another candidate, and its
+   base equals the base of that other candidate.  Note that two
+   candidates can have the same transport address yet have different
+   bases, and these would not be considered redundant.  Frequently, a
+   server reflexive candidate and a host candidate will be redundant
+   when the agent is not behind a NAT.  The agent SHOULD eliminate the
+   redundant candidate with the lower priority.
+
+### 删除冗余的候选地址
+接下来 agent 会删除冗余的候选地址。一个候选地址如果它的传输地址和其它的候选地址相同，并且它的base也和其它候选地址的base相同就是冗余的。注意，两个候选地址可以有相同的传输地址，但是有不同的base，这种并不能当做冗余。经常地，当agent不在NAT下，一个服务反射候选地址和一个主机候选地址将是冗余的。agent应该删除优先级更低的候选地址。
+
+
+
+
+4.1.4.  Choosing Default Candidates
+
+   A candidate is said to be default if it would be the target of media
+   from a non-ICE peer; that target is called the DEFAULT DESTINATION.
+   If the default candidates are not selected by the ICE algorithm when
+   communicating with an ICE-aware peer, an updated offer/answer will be
+   required after ICE processing completes in order to "fix up" the SDP
+   so that the default destination for media matches the candidates
+   selected by ICE.  If ICE happens to select the default candidates, no
+   updated offer/answer is required.
+
+
+
+### 4.1.4 选择默认候选地址
+一个候选地址如果是非ICE端的目标地址，那它就是默认候选地址。那个目标称作默认目的地址。如果还没选出默认的候选地址，在和有ICE的端进行通信时，在ICE结束后，为了修复SDP，以便媒体的默认目的地址匹配被ICE选出的候选地址。会首先发送一个更新的 offer/answer 。如果ICE恰好选出了默认的候选地址，就不需要 更新 offer/answer 的请求。
+
+
+An agent MUST choose a set of candidates, one for each component of
+   each in-use media stream, to be default.  A media stream is in-use if
+   it does not have a port of zero (which is used in RFC 3264 to reject
+   a media stream).  Consequently, a media stream is in-use even if it
+   is marked as a=inactive [RFC4566] or has a bandwidth value of zero.
+
+一个agent 必须选择一个系列的候选地址，每个正在使用的媒体流的每个组件都要有一个作为默认候选地址。如果一个媒体流的端口不是0（在 RFC3264中用于拒绝媒体流），就是在用的媒体流。因此，一个媒体流即便是被标记为 a=inactive [RFC4566]或者 带宽为0 仍是在用的媒体流。
+
+It is RECOMMENDED that default candidates be chosen based on the
+   likelihood of those candidates to work with the peer that is being
+   contacted.  It is RECOMMENDED that the default candidates are the
+   relayed candidates (if relayed candidates are available), server
+   reflexive candidates (if server reflexive candidates are available),
+   and finally host candidates.
+推荐默认的候选地址选择那些能够最优可能成功建立连接的。推荐默认的候选地址是中继候选地址（如果有可用的）,然后是主机反射候选地址（如果有可用的），最后才是主机候选地址
+
+
+4.2.  Lite Implementation Requirements
+
+   Lite implementations only utilize host candidates.  A lite
+   implementation MUST, for each component of each media stream,
+   allocate zero or one IPv4 candidates.  It MAY allocate zero or more
+   IPv6 candidates, but no more than one per each IPv6 address utilized
+   by the host.  Since there can be no more than one IPv4 candidate per
+   component of each media stream, if an agent has multiple IPv4
+   addresses, it MUST choose one for allocating the candidate.  If a
+   host is dual stack, it is RECOMMENDED that it allocate one IPv4
+   candidate and one global IPv6 address.  With the lite implementation,
+   ICE cannot be used to dynamically choose amongst candidates.
+   Therefore, including more than one candidate from a particular scope
+   is NOT RECOMMENDED, since only a connectivity check can truly
+   determine whether to use one address or the other.
+
+## 4.2 轻量级实现的需要
+轻量级实现只是用在主机候选地址类型中。一个轻量级实现必须给每个流的每个组件分配0或者一个IPv4候选地址。它可能分配0或者ipv6候选地址，但是不超过一个IPv6候选地址。因为每个流的每个组件不能超过一个一个IPv4，如果一个agent有多个IPv4，它必须选择一个分配到候选地址。如果一个主机是多栈的，推荐分配一个ipv4并将IPv6设置成全局。对于轻量级实现，ICE不能动态选择候选地址。因此，不建议在特定领域包含多个候选地址，因为只有连接检查才能真正决定是否使用一个候选地址。
+
+Each component has an ID assigned to it, called the component ID.
+   For RTP-based media streams, the RTP itself has a component ID of 1,
+   and RTCP a component ID of 2.  If an agent is using RTCP, it MUST
+   obtain candidates for it.
+
+每个组件都有一个id分配给他，叫做组件ID。对于 基于RTP的媒体流，RTP本身有一个组件id 1，而rtcp有一个组件id 2.如果一个agent使用了RTCP，它必须为RTCP分配候选地址
+
+Each candidate is assigned a foundation.  The foundation MUST be
+   different for two candidates allocated from different IP addresses,
+   and MUST be the same otherwise.  A simple integer that increments for
+   each IP address will suffice.  In addition, each candidate MUST be
+   assigned a unique priority amongst all candidates for the same media
+   stream.  This priority SHOULD be equal to:
+
+   priority = (2^24)*(126) +
+              (2^8)*(IP precedence) +
+              (2^0)*(256 - component ID)
+
+每个候选地址都有一个地基，两个候选地址的ip不同，地基就不能一样。否则就要一样。每个ip分配一个增加的整数就可以满足了。另外，每个流的每个候选地址必须分配一个独立的优先级。这个优先级应该按照下面公式计算:
+
+
+   priority = (2^24)*(126) +
+              (2^8)*(IP precedence) +
+              (2^0)*(256 - component ID)
+
+ If a host is v4-only, it SHOULD set the IP precedence to 65535.  If a
+   host is v6 or dual stack, the IP precedence SHOULD be the precedence
+   value for IP addresses described in RFC 3484 [RFC3484].
+
+如果一个主机只有ipv4的地址，它应该设置IP precedence为65535.如果是一个主机既有ipv4又有ipv6的双栈主机，IP precedence应该参考RFC 3484 [RFC3484]  来进行设置。
+
+ Next, an agent chooses a default candidate for each component of each
+   media stream.  If a host is IPv4 only, there would only be one
+   candidate for each component of each media stream, and therefore that
+   candidate is the default.  If a host is IPv6 or dual stack, the
+   selection of default is a matter of local policy.  This default
+   SHOULD be chosen such that it is the candidate most likely to be used
+   with a peer.  For IPv6-only hosts, this would typically be a globally
+   scoped IPv6 address.  For dual-stack hosts, the IPv4 address is RECOMMENDED
+接下来，一个agent 选择一个默认的候选地址为每一个流的的每个组件。如果一个主机只有IPv4,那每个流的每个组件只有一个候选地址。如果一个主机是IPv6或者多栈主机，默认候选地址的选择主要与本地策略有关。默认选择的候选地址，应该是最有可能被对端连接的候选地址。对于只有IPv6的主机，默认候选地址就是全局范围的IPv6地址。对于多栈主机，建议IPv4作为默认候选地址。
+
+
+
+4.3.  Encoding the SDP
+
+   The process of encoding the SDP is identical between full and lite
+   implementations.
+
+   The agent will include an m line for each media stream it wishes to
+   use.  The ordering of media streams in the SDP is relevant for ICE.
+   ICE will perform its connectivity checks for the first m line first,
+   and consequently media will be able to flow for that stream first.
+   Agents SHOULD place their most important media stream, if there is
+   one, first in the SDP.
+
+## 4.3 编码入SDP
+编入SDP的过程在全实现和轻量级实现中是完全一样的。
+Agent 将会为每个想要使用的媒体流包含一个m行。SDP中媒体流的顺序与ICE相关。ICE首先从第一个m行进行连接检查，因此媒体将可以首先打通那条媒体。agents应该将最重要的媒体流放在最前面。
+
+There will be a candidate attribute for each candidate for a
+   particular media stream.  Section 15 provides detailed rules for
+   constructing this attribute.  The attribute carries the IP address,
+   port, and transport protocol for the candidate, in addition to its
+   properties that need to be signaled to the peer for ICE to work: the
+   priority, foundation, and component ID.  The candidate attribute also
+   carries information about the candidate that is useful for
+   diagnostics and other functions: its type and related transport
+   addresses.
+每个媒体流的每个候选地址都会有一个后弦地址属性。第15章将会详细的阐述属性的构造规则。属性将会携带候选地址的ip地址，端口，传输协议。另外还有为了ICE正常工作的，需要传输给对端的一些属性：优先级，地基，组件id。候选地址的属性也会携带一些为了诊断和其它功能的信息：它的类型 和 相关传输地址
+
+STUN connectivity checks between agents are authenticated using the
+   short-term credential mechanism defined for STUN [RFC5389].  This
+   mechanism relies on a username and password that are exchanged
+   through protocol machinery between the client and server.  With ICE,
+   the offer/answer exchange is used to exchange them.  The username
+   part of this credential is formed by concatenating a username
+   fragment from each agent, separated by a colon.  Each agent also
+   provides a password, used to compute the message integrity for
+   requests it receives.  The username fragment and password are
+   exchanged in the ice-ufrag and ice-pwd attributes, respectively.  In
+   addition to providing security, the username provides disambiguation
+   and correlation of checks to media streams.  See Appendix B.4 for
+   motivation.
+
+   If an agent is a lite implementation, it MUST include an "a=ice-lite"
+   session-level attribute in its SDP.  If an agent is a full
+   implementation, it MUST NOT include this attribute.
+agents之间的Stun 连接检查采用为Stun定义【RFC5389】的短时证书授权机制。之中机制依赖于客户端和服务端交换的用户名和密码。在ICE下，使用offer/answer的交换来交换它。证书的用户名部分是冒号分割的各个agent的用户名。每个agent也会提供一个密码，用来计算收到的请求消息的完整性。用户名片段和密码片段是在ice-ufrag 和 ice-pwd 属性来传递。除了为了安全，用户名提供消除歧义和相关检查。可以看附录B.4了解更多
+如果一个agent是轻量级实现。它的sdp中必须包含一个a=ice-lite的会话级别的属性。如果一个agent是一个完整实现，就不能包含这个属性。
+ The default candidates are added to the SDP as the default
+   destination for media.  For streams based on RTP, this is done by
+   placing the IP address and port of the RTP candidate into the c and m
+   lines, respectively.  If the agent is utilizing RTCP, it MUST encode
+   the RTCP candidate using the a=rtcp attribute as defined in RFC 3605
+   [RFC3605].  If RTCP is not in use, the agent MUST signal that using
+   b=RS:0 and b=RR:0 as defined in RFC 3556 [RFC3556].
+默认候选地址被添加在sdp中作为媒体的默认地址。对于基于RTP的流来说，通过将RTP候选地址的ip和端口分别放在c和m行来实现。如果一个agent使用了RTCP，她必须使用定义在RFC3605 a=rtcp属性 编码RTCP候选地址。如果RTCP没有被使用，agent就必须使用定义在RFC3556中的 b=RS:0 和b=RR:0 
+
+   The transport addresses that will be the default destination for
+   media when communicating with non-ICE peers MUST also be present as
+   candidates in one or more a=candidate lines.
+当和非ICE端进行通信时，传输地址将作为默认的目的地址。也必须展示为一个多多个a=candidate 样式的候选地址
+
+   ICE provides for extensibility by allowing an offer or answer to
+   contain a series of tokens that identify the ICE extensions used by
+   that agent.  If an agent supports an ICE extension, it MUST include
+   the token defined for that extension in the ice-options attribute.
+ICE通过允许offer或者answer包含一系列标记用来识别agent的ICE扩展，使ICE具有可扩展性。如果一个agent支持ice扩展，它必须包含那个定义在ice-options属性中的标记。
+
+The following is an example SDP message that includes ICE attributes
+   (lines folded for readability):
+v=0
+       o=jdoe 2890844526 2890842807 IN IP4 10.0.1.1
+       s=
+       c=IN IP4 192.0.2.3
+       t=0 0
+       a=ice-pwd:asd88fgpdd777uzjYhagZg
+       a=ice-ufrag:8hhY
+       m=audio 45664 RTP/AVP 0
+       b=RS:0
+       b=RR:0
+       a=rtpmap:0 PCMU/8000
+       a=candidate:1 1 UDP 2130706431 10.0.1.1 8998 typ host
+       a=candidate:2 1 UDP 1694498815 192.0.2.3 45664 typ srflx raddr
+   10.0.1.1 rport 8998
+
+下面是一个包含ICE属性的SDP消息的例子（为了方便阅读，有些行被隐藏了）：
+       v=0
+       o=jdoe 2890844526 2890842807 IN IP4 10.0.1.1
+       s=
+       c=IN IP4 192.0.2.3
+       t=0 0
+       a=ice-pwd:asd88fgpdd777uzjYhagZg
+       a=ice-ufrag:8hhY
+       m=audio 45664 RTP/AVP 0
+       b=RS:0
+       b=RR:0
+       a=rtpmap:0 PCMU/8000
+       a=candidate:1 1 UDP 2130706431 10.0.1.1 8998 typ host
+       a=candidate:2 1 UDP 1694498815 192.0.2.3 45664 typ srflx raddr 10.0.1.1 rport 8998
+
+ Once an agent has sent its offer or its answer, that agent MUST be
+   prepared to receive both STUN and media packets on each candidate.
+   As discussed in Section 11.1, media packets can be sent to a
+   candidate prior to its appearance as the default destination for
+   media in an offer or answer.
+
+一旦一个agent已经发送它的offer或者answer，那个agent必须准备在每一个候选地址上接收STUN 和媒体数据包。就像11.1讨论的那样，媒体数据包在优先的候选地址出现之前，可以被发送到一个offer或answer中的媒体的默认的地址
+
+
+5.  Receiving the Initial Offer
+
+   When an agent receives an initial offer, it will check if the offerer
+   supports ICE, determine its own role, gather candidates, prioritize
+   them, choose default candidates, encode and send an answer, and for
+   full implementations, form the check lists and begin connectivity
+   checks.
+
+# 5. 接收初始化offer
+当一个agent 接收到一个初始化offer时，它将会检查这个offer提供者是否支持ICE，然后决定它自己的角色，收集候选地址，按照优先级排序候选地址，选择默认候选地址，编入SDP并发送answer，并且对于全实现，生成候选地址检查列表并开始连接性检查。
+
+
+5.1.  Verifying ICE Support
+
+   The agent will proceed with the ICE procedures defined in this
+   specification if, for each media stream in the SDP it received, the
+   default destination for each component of that media stream appears
+   in a candidate attribute.  For example, in the case of RTP, the IP
+   address and port in the c and m lines, respectively, appear in a
+   candidate attribute and the value in the rtcp attribute appears in a
+   candidate attribute.
+
+   If this condition is not met, the agent MUST process the SDP based on
+   normal RFC 3264 procedures, without using any of the ICE mechanisms
+   described in the remainder of this specification with the following
+   exceptions:
+
+   1.  The agent MUST follow the rules of Section 10, which describe
+       keepalive procedures for all agents.
+
+
+## 5.1 核对是否支持ICE
+如果存在默认目的地址的话，Agent将会为SDP描述中它要收到的每个媒体流处理本规范定义的ICE过程。例如，在RTP中，IP地址在候选地址属性的c和m行，and the value in the rtcp attribute appears in a candidate attribute.
+如果条件不满足，agent必须参照RFC3264的规范来处理。如果出现下面异常也不需要再理会本规范：
+1. agent必须遵从第10章的规则，描述了如何保活。
+
+   2.  If the agent is not proceeding with ICE because there were
+       a=candidate attributes, but none that matched the default
+       destination of the media stream, the agent MUST include an a=ice-
+       mismatch attribute in its answer.
+
+ 2. 如果agent 因为存在a= candidate 属性，但是不是媒体的默认地址，agent必须在answer中包含a=ice-mismatch属性
+
+  3.  If the default candidates were relayed candidates learned through
+       a TURN server, the agent MUST create permissions in the TURN
+       server for the IP addresses learned from its peer in the SDP it
+       just received.  If this is not done, initial packets in the media
+       stream from the peer may be lost.
+
+3。如果默认候选地址是从turn中得到的中继候选地址，agent必须在turn中未对应的ip创建权限。如果没有这样做，初始包都可能会丢失。
+
+
+5.2.  Determining Role
+
+   For each session, each agent takes on a role.  There are two roles --
+   controlling and controlled.  The controlling agent is responsible for
+   the choice of the final candidate pairs used for communications.  For
+   a full agent, this means nominating the candidate pairs that can be
+   used by ICE for each media stream, and for generating the updated
+   offer based on ICE's selection, when needed.  For a lite
+   implementation, being the controlling agent means selecting a
+   candidate pair based on the ones in the offer and answer (for IPv4,
+   there is only ever one pair), and then generating an updated offer
+   reflecting that selection, when needed (it is never needed for an
+   IPv4-only host).  The controlled agent is told which candidate pairs
+   to use for each media stream, and does not generate an updated offer
+   to signal this information.  The sections below describe in detail
+   the actual procedures followed by controlling and controlled nodes.
+
+
+## 5.2 决定角色
+对于每个会话，每个agent都有一个角色。一共有两种角色，主控和被控。主控agent负责最终候选地址的选择。对于全实现的agent，这意味着可以决定ICE中每个媒体流可以使用的候选地址，以及决定何时需要产生升级offer。对于轻量级实现的，主控意味着基于offer和answer选择候选地址（对于ipv4只有一对）。以及何时需要产生升级offer。被控agent被告知使用哪个候选地址，以及不能产生升级offer。接下来详细描述实际的主控和被控的过程。
+
+
+The rules for determining the role and the impact on behavior are as
+   follows:
+
+   Both agents are full:  The agent that generated the offer which
+      started the ICE processing MUST take the controlling role, and the
+      other MUST take the controlled role.  Both agents will form check
+      lists, run the ICE state machines, and generate connectivity
+      checks.  The controlling agent will execute the logic in
+      Section 8.1 to nominate pairs that will be selected by ICE, and
+      then both agents end ICE as described in Section 8.1.2.  In
+      unusual cases, described in Appendix B.11, it is possible for both
+      agents to mistakenly believe they are controlled or controlling.
+      To resolve this, each agent MUST select a random number, called
+      the tie-breaker, uniformly distributed between 0 and (2**64) - 1
+      (that is, a 64-bit positive integer).  This number is used in
+      connectivity checks to detect and repair this case, as described
+      in Section 7.1.2.2.
+
+
+决定角色的规则和影响行为的规则是:
+如果两个agent都是全实现：启动ICE过程并产生offer的agent，必须作为主控。其它只能作为被控。每个agent都会生成检查列表，并且都要运行ICE状态机，并执行连接检查。主控agent将会执行8.1节中的逻辑来选择ICE使用的候选地址。大多数不会出现附录B.11中出现的情况，就是说有可能两个agent都误认为他们都是主控。为了解决这个问题，每个agent必须选择一个随机数，叫做”tie-breaker“，均匀分布在2~2**64-1（因为是64位整数）之间.这个数字用于连接检查时检测和修复种种情况。将会在7.1.2.2中叙述
+
+  One agent full, one lite:  The full agent MUST take the controlling
+      role, and the lite agent MUST take the controlled role.  The full
+      agent will form check lists, run the ICE state machines, and
+      generate connectivity checks.  That agent will execute the logic
+      in Section 8.1 to nominate pairs that will be selected by ICE, and
+      use the logic in Section 8.1.2 to end ICE.  The lite
+      implementation will just listen for connectivity checks, receive
+      them and respond to them, and then conclude ICE as described in
+      Section 8.2.  For the lite implementation, the state of ICE
+      processing for each media stream is considered to be Running, and
+      the state of ICE overall is Running.
+
+对于一个全实现，一个轻量级实现：全实现agent必须作为主控，轻量级实现不能作为主控。全实现agent将会生成检查列表，运行ICE状态机，执行连接检查。控agent将会执行8.1节中的逻辑来选择ICE使用的候选地址，并且会用来结束ICE。轻量级实现，只是监听连接检查，接收和回复它们。然后向8.2中描述的结束ICE。对于轻量级实现的agent，ICE的状态是一直在运行。
+
+Both lite:  The agent that generated the offer which started the ICE
+      processing MUST take the controlling role, and the other MUST take
+      the controlled role.  In this case, no connectivity checks are
+      ever sent.  Rather, once the offer/answer exchange completes, each
+      agent performs the processing described in Section 8 without
+      connectivity checks.  It is possible that both agents will believe
+      they are controlled or controlling.  In the latter case, the
+      conflict is resolved through glare detection capabilities in the
+      signaling protocol carrying the offer/answer exchange.  The state
+      of ICE processing for each media stream is considered to be
+      Running, and the state of ICE overall is Running.
+
+对于双方都是轻量级实现：启动ICE过程并产生offer的agent，必须作为主控。其它只能作为被控。这种情况没有连接检查。一旦offer/answer交换完成，每个agent开始执行第8章的过程，而不进行连接检查。有可能双方都认为自己是被控或主控，在后一种情况下。冲突通过信令协议中的glare检测能力来解决冲突。ICE的状态是一直在运行。
+
+Once roles are determined for a session, they persist unless ICE is
+   restarted.  An ICE restart (Section 9.1) causes a new selection of
+   roles and tie-breakers.
+
+一旦角色在会话期间被决定了，它们会一直保持到重启。一个ICE 重启会引起一次新的选举和关系中断。
+
+5.3.  Gathering Candidates
+
+   The process for gathering candidates at the answerer is identical to
+   the process for the offerer as described in Section 4.1.1 for full
+   implementations and Section 4.2 for lite implementations.  It is
+   RECOMMENDED that this process begin immediately on receipt of the
+   offer, prior to alerting the user.  Such gathering MAY begin when an
+   agent starts.
+## 5.3 收集候选地址
+提供answer的端收集候选地址的过程不论是全实现还是轻量级实现和offer方收集的过程相同。推荐在收到offer后立马就启动收集过程, prior to alerting the user. 这样当agent启动时就可以启动收集。
+
+
+5.4.  Prioritizing Candidates
+
+   The process for prioritizing candidates at the answerer is identical
+   to the process followed by the offerer, as described in Section 4.1.2
+   for full implementations and Section 4.2 for lite implementations.
+
+## 5.4 优先级排序
+Answer端候选地址优先级排序的过程和offer端相同。
+
+
+5.5.  Choosing Default Candidates
+
+   The process for selecting default candidates at the answerer is
+   identical to the process followed by the offerer, as described in
+   Section 4.1.4 for full implementations and Section 4.2 for lite
+   implementations.
+
+## 5.5选择默认候选地址
+Answer端选默认候选地址的过程和offer端相同。
+
+
+5.6.  Encoding the SDP
+
+   The process for encoding the SDP at the answerer is identical to the
+   process followed by the offerer for both full and lite
+   implementations, as described in Section 4.3.
+
+## 5.6 SDP编码
+Answer端SDP编码和offer端相同。
+
+
+5.7.  Forming the Check Lists
+
+   Forming check lists is done only by full implementations.  Lite
+   implementations MUST skip the steps defined in this section.
+
+   There is one check list per in-use media stream resulting from the
+   offer/answer exchange.  To form the check list for a media stream,
+   the agent forms candidate pairs, computes a candidate pair priority,
+   orders the pairs by priority, prunes them, and sets their states.
+   These steps are described in this section.
+
+## 5.7 生成检查列表
+生成检查列表只有在全实现的agent上才会发生。轻量级实现的一定会跳过这一步。
+每一个在用的媒体流都会有一个检查列表。为了生成检查列表，agent会生成候选地址对儿，计算优先级，对优先级排序，设置候选地址状态。这部分会展开描述这个过程。
+
+
+5.7.1.  Forming Candidate Pairs
+
+   First, the agent takes each of its candidates for a media stream
+   (called LOCAL CANDIDATES) and pairs them with the candidates it
+   received from its peer (called REMOTE CANDIDATES) for that media
+   stream.  In order to prevent the attacks described in Section 18.5.2,
+   agents MAY limit the number of candidates they'll accept in an offer
+   or answer.  A local candidate is paired with a remote candidate if
+   and only if the two candidates have the same component ID and have
+   the same IP address version.  It is possible that some of the local
+   candidates won't get paired with remote candidates, and some of the
+   remote candidates won't get paired with local candidates.  This can
+   happen if one agent doesn't include candidates for the all of the
+   components for a media stream.  If this happens, the number of
+   components for that media stream is effectively reduced, and
+   considered to be equal to the minimum across both agents of the
+   maximum component ID provided by each agent across all components for
+   the media stream.
+
+### 5.7.1 生成候选地址对
+首先agent 会获取媒体流的每个候选地址并配对。然后接收对端的候选地址。为了防止 18.5.2中所说的攻击，agent 可能想要限制他们接收到的offer或者answer中候选地址的数量。一个本地候选地址和一个远程候选地址如果有相同的组件ID并且有相同的IP地址版本，就进行配对。有可能有些本地候选地址没有可配对的额远程候选地址，也可能有些远程的候选地址没有本地后选地址可配对。这种情况发生在一个 agent没有包含一个媒体流的所有的组件的所有候选地址。如果这种情况发生，媒体流的组件数会明显减少，并且等于一个媒体流在两个agent中组件的最小值。
+
+In the case of RTP, this would happen when one agent provides
+   candidates for RTCP, and the other does not.  As another example, the
+   offerer can multiplex RTP and RTCP on the same port and signals that
+   it can do that in the SDP through an SDP attribute [RFC5761].
+   However, since the offerer doesn't know if the answerer can perform
+   such multiplexing, the offerer includes candidates for RTP and RTCP
+   on separate ports, so that the offer has two components per media
+   stream.  If the answerer can perform such multiplexing, it would
+   include just a single component for each candidate - for the combined
+   RTP/RTCP mux.  ICE would end up acting as if there was just a single
+   component for this candidate.
+
+
+对于RTP的情况，这种情况会发生在一个agent为RTCP提供了候选地址而另外一个没有提供的时候。另外一种情况是，offer方使用了复用技术用同一个端口传输RTP和RTCP，可以再SDP的属性中声明它。然而，offer方不知道answer方是否会使用这种复用技术，offer方将RTP和RTCP在不同的端口，所有会有两个媒体组件。如果answer中使用复用技术，它将只有一个组件。ICE将会结束，因为只有一个组件。
+
+The candidate pairs whose local and remote candidates are both the
+   default candidates for a particular component is called,
+   unsurprisingly, the default candidate pair for that component.  This
+   is the pair that would be used to transmit media if both agents had
+   not been ICE aware.
+候选地址对中本地和远程都是默认候选地址，这种情况很常见。这对儿在agents都没有进行ICE时将会用于传输媒体
+
+In order to aid understanding, Figure 6 shows the relationships
+   between several key concepts -- transport addresses, candidates,
+   candidate pairs, and check lists, in addition to indicating the main
+   properties of candidates and candidate pairs.
+
+为了帮助理解 图6展示了多个关键概念的关系--传输地址，候选地址，候选地址对儿，检查列表，以及其它主要候选地址和候选地址对儿的属性。
+
+
+
+       +------------------------------------------+
+       |                                          |
+       | +---------------------+                  |
+       | |+----+ +----+ +----+ |   +Type          |
+       | || IP | |Port| |Tran| |   +Priority      |
+       | ||Addr| |    | |    | |   +Foundation    |
+       | |+----+ +----+ +----+ |   +ComponentiD   |
+       | |      Transport      |   +RelatedAddr   |
+       | |        Addr         |                  |
+       | +---------------------+   +Base          |
+       |             Candidate                    |
+       +------------------------------------------+
+       *                                         *
+       *    *************************************
+       *    *
+     +-------------------------------+
+    .|                               |
+     | Local     Remote              |
+     | +----+    +----+   +default?  |
+     | |Cand|    |Cand|   +valid?    |
+     | +----+    +----+   +nominated?|
+     |                    +State     |
+     |                               |
+     |                               |
+     |          Candidate Pair       |
+     +-------------------------------+
+     *                              *
+     *                  ************
+     *                  *
+     +------------------+
+     |  Candidate Pair  |
+     +------------------+
+     +------------------+
+     |  Candidate Pair  |
+     +------------------+
+     +------------------+
+     |  Candidate Pair  |
+     +------------------+
+
+            Check
+            List
+
+               Figure 6: Conceptual Diagram of a Check List
+
+
+
+
+
+5.7.2.  Computing Pair Priority and Ordering Pairs
+
+   Once the pairs are formed, a candidate pair priority is computed.
+   Let G be the priority for the candidate provided by the controlling
+   agent.  Let D be the priority for the candidate provided by the
+   controlled agent.  The priority for a pair is computed as:
+
+      pair priority = 2^32*MIN(G,D) + 2*MAX(G,D) + (G>D?1:0)
+
+   Where G>D?1:0 is an expression whose value is 1 if G is greater than
+   D, and 0 otherwise.  Once the priority is assigned, the agent sorts
+   the candidate pairs in decreasing order of priority.  If two pairs
+   have identical priority, the ordering amongst them is arbitrary.
+
+
+### 5.7.2 计算候选地址对儿的优先级和排序
+一旦候选地址对儿已经生成，就要计算候选地址对儿的优先级。G 代表 主控agent提供的额候选地址的优先级。D代表被控agent的候选地址的优先级。候选地址对儿的优先级计算方法:
+
+pair priority = 2^32*MIN(G,D) + 2*MAX(G,D) + (G>D?1:0)
+
+G>D?1:0 是值当G比D大时为1 否则为0.一段优先级被分配了，agent就会以优先级排序候选地址对儿。如果两个候选地址对儿，具有相同的优先级，就可以随意排序
+
+
+
+5.7.3.  Pruning the Pairs
+
+   This sorted list of candidate pairs is used to determine a sequence
+   of connectivity checks that will be performed.  Each check involves
+   sending a request from a local candidate to a remote candidate.
+   Since an agent cannot send requests directly from a reflexive
+   candidate, but only from its base, the agent next goes through the
+   sorted list of candidate pairs.  For each pair where the local
+   candidate is server reflexive, the server reflexive candidate MUST be
+   replaced by its base.  Once this has been done, the agent MUST prune
+   the list.  This is done by removing a pair if its local and remote
+   candidates are identical to the local and remote candidates of a pair
+   higher up on the priority list.  The result is a sequence of ordered
+   candidate pairs, called the check list for that media stream.
+
+   In addition, in order to limit the attacks described in
+   Section 18.5.2, an agent MUST limit the total number of connectivity
+   checks the agent performs across all check lists to a specific value,
+   and this value MUST be configurable.  A default of 100 is
+   RECOMMENDED.  This limit is enforced by discarding the lower-priority
+   candidate pairs until there are less than 100.  It is RECOMMENDED
+   that a lower value be utilized when possible, set to the maximum
+   number of plausible checks that might be seen in an actual deployment
+   configuration.  The requirement for configuration is meant to provide
+   a tool for fixing this value in the field if, once deployed, it is
+   found to be problematic.
+
+### 5.7.3 剔除候选地址
+
+已经排序的候选地址对儿用于决定连接性检查的顺序。每个检查将会从本地候选地址发送一个请求到远程候选地址。因为一个agent不能直接从一个反射候选地址发送请求，但可以从他的base，agent 然后挨个检查已经排好序的候选地址对儿列表。
+对于每一个候选地址对儿，本地候选地址是服务反射候选地址，服务反射候选地址必须被base替换。一旦这样做过，agent必须剔除掉这对儿。如果一个候选地址对儿的本地和远程和更高优先级的本地和远程一样，就会剔除掉。结果就是一个有序的候选地址对列表，称作检查列表。
+另外为了防止18.5.2中所说的攻击，agent必须限制检查列表中候选地址对儿的总数。检查所有列表到一个配置的总数。推荐默认是100.这个限制就是强制删除低优先级的直到少于100为止。建议设置一个更小点的值，实际部署中在配置文件中可以看到最大值。之所以需要配置，是为了方便修改。否则上线后不好修改。
+
+
+5.7.4.  Computing States
+
+   Each candidate pair in the check list has a foundation and a state.
+   The foundation is the combination of the foundations of the local and
+   remote candidates in the pair.  The state is assigned once the check
+   list for each media stream has been computed.  There are five
+   potential values that the state can have:
+
+   Waiting:  A check has not been performed for this pair, and can be
+      performed as soon as it is the highest-priority Waiting pair on
+      the check list.
+
+   In-Progress:  A check has been sent for this pair, but the
+      transaction is in progress.
+
+   Succeeded:  A check for this pair was already done and produced a
+      successful result.
+
+   Failed:  A check for this pair was already done and failed, either
+      never producing any response or producing an unrecoverable failure
+      response.
+
+   Frozen:  A check for this pair hasn't been performed, and it can't
+      yet be performed until some other check succeeds, allowing this
+      pair to unfreeze and move into the Waiting state.
+
+### 5.7.4 计算状态
+检查列表中的每个候选地址对儿都有一个‘地基’和一个状态。地基是本地和远程候选地址的地基的拼接。状态是在检查完毕后被分配的。状态一共有5种值：
+
+等待：还没有进行检查，当它是最高优先级的检查状态时，就会被执行。
+进行中：正在进行检查
+成功：检查已经完成，并且得到一个成功的结果
+失败:检查完成并且失败，要么是没有收到回复，要么就是回复不是预期的。
+冻结：检查还没有执行，但它需要等其他检查成功了，它才可以进行。允许执行前先回变为等待状态。
+
+As ICE runs, the pairs will move between states as shown in Figure 7.
+
+一个ICE运行过程中，状态变化如图7所示
+
+      +-----------+
+      |           |
+      |           |
+      |  Frozen   |
+      |           |
+      |           |
+      +-----------+
+            |
+            |unfreeze
+            |
+            V
+      +-----------+         +-----------+
+      |           |         |           |
+      |           | perform |           |
+      |  Waiting  |-------->|In-Progress|
+      |           |         |           |
+      |           |         |           |
+      +-----------+         +-----------+
+                                  / |
+                                //  |
+                              //    |
+                            //      |
+                           /        |
+                         //         |
+               failure //           |success
+                     //             |
+                    /               |
+                  //                |
+                //                  |
+              //                    |
+             V                      V
+      +-----------+         +-----------+
+      |           |         |           |
+      |           |         |           |
+      |   Failed  |         | Succeeded |
+      |           |         |           |
+      |           |         |           |
+      +-----------+         +-----------+
+
+                         Figure 7: Pair State FSM
+
+
+
+
+
+The initial states for each pair in a check list are computed by
+   performing the following sequence of steps:
+
+   1.  The agent sets all of the pairs in each check list to the Frozen
+       state.
+每个地址对儿初始state的计算跟进下面的步骤:
+1.agent先给所有的地址对儿设置为冻结状态
+
+2.  The agent examines the check list for the first media stream (a
+       media stream is the first media stream when it is described by
+       the first m line in the SDP offer and answer).  For that media
+       stream:
+
+       *  For all pairs with the same foundation, it sets the state of
+          the pair with the lowest component ID to Waiting.  If there is
+          more than one such pair, the one with the highest priority is
+          used.
+
+   One of the check lists will have some number of pairs in the Waiting
+   state, and the other check lists will have all of their pairs in the
+   Frozen state.  A check list with at least one pair that is Waiting is
+   called an active check list, and a check list with all pairs Frozen
+   is called a frozen check list.
+
+2.agent 检查第一个媒体的的检查列表（SDP的offer和answer中第一个m行）。对于该媒体流:
+所有对都有相同的地基，然后设置组件ID最小的地址对为等待状态。如果有多个地址对儿，使用最高优先级的地址地儿。
+其中一个检查列表有几个等待状态的地址对儿，其它的检查列表都是冻结装填。至少有一个等待状态的检查列表称作”激活检查列表“，所有都是冻结状态的检查列表称作 冻结检查列表
+
+
+
+
+ The check list itself is associated with a state, which captures the
+   state of ICE checks for that media stream.  There are three states:
+
+   Running:  In this state, ICE checks are still in progress for this
+      media stream.
+
+   Completed:  In this state, ICE checks have produced nominated pairs
+      for each component of the media stream.  Consequently, ICE has
+      succeeded and media can be sent.
+
+   Failed:  In this state, the ICE checks have not completed
+      successfully for this media stream.
+
+检查列表本身对应着一个状态，代表着ICE检查那个媒体流的状态。有三个状态
+运行中：在这种状态下，ICE检查证处于该流过程中。
+已完成：这种状态下，ICE 检查 已经为每个流的每个组件选出了地址对儿。因此ICE已经成功，并可以发送媒体流。
+失败状态：这种状态下，ICE检查没有成功完成。
+
+   When a check list is first constructed as the consequence of an
+   offer/answer exchange, it is placed in the Running state.
+
+   ICE processing across all media streams also has a state associated
+   with it.  This state is equal to Running while ICE processing is
+   under way.  The state is Completed when ICE processing is complete
+   and Failed if it failed without success.  Rules for transitioning
+   between states are described below.
+
+当检查列表首次被创建，它将处于运行状态。
+ICE处理所有媒体流，也有一个状态。这个状态在ICE正运行时就是”运行中“。当ICE完成时就是”已完成。“。当失败时是”已失败“。状态转变的规则在下面会描述。
+
+
+5.8.  Scheduling Checks
+
+   Checks are generated only by full implementations.  Lite
+   implementations MUST skip the steps described in this section.
+
+   An agent performs ordinary checks and triggered checks.  The
+   generation of both checks is governed by a timer that fires
+   periodically for each media stream.  The agent maintains a FIFO
+   queue, called the triggered check queue, which contains candidate
+   pairs for which checks are to be sent at the next available
+   opportunity.  When the timer fires, the agent removes the top pair
+   from the triggered check queue, performs a connectivity check on that
+   pair, and sets the state of the candidate pair to In-Progress.  If
+   there are no pairs in the triggered check queue, an ordinary check is
+   sent.
+
+## 5.8 检查的执行
+检查只有在全实现中才会被安排。轻量级实现一定会跳过这个步骤。一个agent 执行普通的检查并且触发检查。检查的产生被一个定时器控制。每个流都会周期的触发。agent会维护一个FIFO的队列成为触发检查队列，它包含了下次将要可用的地址对儿。当定时器到达时，agent会删除顶层的的地址对儿，执行连接检查，并且设置候选地址对儿的状态为进行中。如果没有地址对儿在队列中，一个普通的检查将会被执行。
+
+
+Once the agent has computed the check lists as described in
+   Section 5.7, it sets a timer for each active check list.  The timer
+   fires every Ta*N seconds, where N is the number of active check lists
+   (initially, there is only one active check list).  Implementations
+   MAY set the timer to fire less frequently than this.  Implementations
+   SHOULD take care to spread out these timers so that they do not fire
+   at the same time for each media stream.  Ta and the retransmit timer
+   RTO are computed as described in Section 16.  Multiplying by N allows
+   this aggregate check throughput to be split between all active check
+   lists.  The first timer fires immediately, so that the agent performs
+   a connectivity check the moment the offer/answer exchange has been
+   done, followed by the next check Ta seconds later (since there is
+   only one active check list).
+一旦一个agent 已经按照5.7中介绍的计算出检查列表。就会为每个 激活的检查列表设置一个定时器。定时器 每τ*N秒触发一次，N是检查列表的数目（刚开始只有一个检查列表）。实现上 应该关心这些定时器的相隔很远，就是为了防止被同时触发。它和再发送的定时器RT0的计算方式 是在第16章描述的。被N乘 允许这个总体检查被分散在所有的激活检查列表上。第一个定时器立即执行，就是为了能够在收到offer/answer 后立马就可以启动连接检查，下一次检查是在τ秒后（因为这时候只有一个激活列表）
+
+
+When the timer fires and there is no triggered check to be sent, the
+   agent MUST choose an ordinary check as follows:
+
+   o  Find the highest-priority pair in that check list that is in the
+      Waiting state.
+
+   o  If there is such a pair:
+
+      *  Send a STUN check from the local candidate of that pair to the
+         remote candidate of that pair.  The procedures for forming the
+         STUN request for this purpose are described in Section 7.1.2.
+
+      *  Set the state of the candidate pair to In-Progress.
+
+   o  If there is no such pair:
+
+      *  Find the highest-priority pair in that check list that is in
+         the Frozen state.
+
+      *  If there is such a pair:
+
+         +  Unfreeze the pair.
+
+         +  Perform a check for that pair, causing its state to
+            transition to In-Progress.
+
+
+当定时器触发了，并且没有检查可以被发送，则必须按照下面的规则选择一个普通检查：
+*找到最高优先级的检查列表 设置为等待中状态
+* 如果其中有这样的地址对儿：
+从本地候选地址向远程候选地址发送一个STUN检查。生成检查的过程在7.1.2中描述
+设置候选地址的状态为进行中
+
+*如果没有这样的地址对儿
+从冷冻状态找到最高优先级的地址对儿
+如果有
+解冻这个地址对儿
+对该地址对儿执行检查，设置状态为进行中
+
+To compute the message integrity for the check, the agent uses the
+   remote username fragment and password learned from the SDP from its
+   peer.  The local username fragment is known directly by the agent for
+   its own candidate.
+
+
+为了完整的计算检查消息的完整性，agent使用了对方SDP中的用户名和密码，本地用户名因为是自己的候选地址，agent是可以直接在拿到的。
+
